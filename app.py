@@ -33,24 +33,41 @@ table = dynamodb.Table("Students")
 
 def serialize_item(item):
     """
-    Convert a DynamoDB item dict into a plain dict suitable for JSON.
-    Handles String (S), Number (N), Boolean (BOOL), List (L), and Map (M).
+    Return the item as a plain dict suitable for JSON.
+
+    The boto3 Table resource already unmarshals DynamoDB AttributeValue
+    descriptors into native Python types (str, int, bool, list, dict),
+    so items from scan/get_item are already plain Python dicts.
+
+    This function is kept as a safety net: if a value somehow still
+    carries a DynamoDB type descriptor (e.g. {"S": "..."}), we unwrap it.
     """
-    result = {}
-    for key, value in item.items():
-        if "S" in value:
-            result[key] = value["S"]
-        elif "N" in value:
-            result[key] = int(value["N"]) if value["N"].isdigit() else float(value["N"])
-        elif "BOOL" in value:
-            result[key] = value["BOOL"]
-        elif "L" in value:
-            result[key] = [serialize_item(v) if isinstance(v, dict) else v for v in value["L"]]
-        elif "M" in value:
-            result[key] = serialize_item(value["M"])
-        else:
-            result[key] = value
-    return result
+    # DynamoDB type-descriptor tags used by the low-level API
+    _ddb_types = ("S", "N", "BOOL", "L", "M")
+
+    def _unwrap(value):
+        """Recursively unwrap a single value if it looks like a descriptor."""
+        if isinstance(value, dict) and len(value) == 1:
+            tag = next(iter(value))
+            if tag in _ddb_types:
+                inner = value[tag]
+                if tag == "S":
+                    return inner
+                elif tag == "N":
+                    return int(inner) if isinstance(inner, str) and inner.isdigit() else float(inner)
+                elif tag == "BOOL":
+                    return inner
+                elif tag == "L":
+                    return [_unwrap(v) for v in inner]
+                elif tag == "M":
+                    return serialize_item(inner)
+        if isinstance(value, dict):
+            return {k: _unwrap(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_unwrap(v) for v in value]
+        return value
+
+    return {k: _unwrap(v) for k, v in item.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -112,20 +129,21 @@ def validate_student(data, partial=False):
 
 def build_put_item(student_id, data):
     """
-    Build a DynamoDB-ready item dict from validated Python values.
-    Uses explicit DynamoDB type descriptors (S, N, BOOL, L, M).
+    Build a DynamoDB-ready item using Python-native values.
+
+    The boto3 Table resource API automatically marshals native Python
+    types into DynamoDB AttributeValue descriptors, so we should NOT
+    wrap values in {"S": ...}, {"N": ...}, etc. manually.
     """
     item = {
-        "student_id": {"S": student_id},
-        "name": {"S": data["name"]},
-        "age": {"N": str(data["age"])},
-        "is_active": {"BOOL": data.get("is_active", True)},
-        "subjects": {"L": [{"S": s} for s in data.get("subjects", [])]},
+        "student_id": student_id,
+        "name": data["name"],
+        "age": data["age"],
+        "is_active": data.get("is_active", True),
+        "subjects": data.get("subjects", []),
         "address": {
-            "M": {
-                "city": {"S": data.get("address", {}).get("city", "")},
-                "pin": {"S": data.get("address", {}).get("pin", "")},
-            }
+            "city": data.get("address", {}).get("city", ""),
+            "pin": data.get("address", {}).get("pin", ""),
         },
     }
     return item
@@ -199,34 +217,20 @@ def update_student(student_id):
     expr_attr_names = {}
     expr_attr_values = {}
 
-    field_map = {
-        "name": ("name", "S"),
-        "age": ("age", "N"),
-        "is_active": ("is_active", "BOOL"),
-        "subjects": ("subjects", "L"),
-        "address": ("address", "M"),
-    }
-
     for field_name in ["name", "age", "is_active", "subjects", "address"]:
         if field_name in data:
             attr_name = f"#{field_name}"
             attr_val = f":{field_name}"
             expr_attr_names[attr_name] = field_name
 
-            if field_name == "age":
-                expr_attr_values[attr_val] = {"N": str(data[field_name])}
-            elif field_name == "subjects":
-                expr_attr_values[attr_val] = {"L": [{"S": s} for s in data[field_name]]}
-            elif field_name == "address":
+            # Use Python-native values — the Table resource auto-marshals them.
+            if field_name == "address":
                 expr_attr_values[attr_val] = {
-                    "M": {
-                        "city": {"S": data[field_name].get("city", "")},
-                        "pin": {"S": data[field_name].get("pin", "")},
-                    }
+                    "city": data[field_name].get("city", ""),
+                    "pin": data[field_name].get("pin", ""),
                 }
             else:
-                # name (S) and is_active (BOOL) — pass through as-is with boto3 marshalling
-                expr_attr_values[attr_val] = {field_map[field_name][1]: data[field_name]}
+                expr_attr_values[attr_val] = data[field_name]
 
             update_expr_parts.append(f"{attr_name} = {attr_val}")
 
